@@ -1,0 +1,25 @@
+# Team parity: `docker compose up` runs the gateway + dashboard.
+# The hardware folks don't need this; it's for the Pi-side stack.
+services:
+  gateway:
+    build: .
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ugs-data:/data
+    environment:
+      UGS_DB_PATH: /data/ugs.duckdb
+
+  dashboard:
+    build: .
+    command: streamlit run app/dashboard.py --server.address=0.0.0.0 --server.port=8501
+    ports:
+      - "127.0.0.1:8501:8501"
+    environment:
+      GATEWAY_URL: http://gateway:8000
+    depends_on:
+      - gateway
+
+volumes:
+  ugs-data:
