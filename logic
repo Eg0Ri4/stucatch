@@ -4,19 +4,71 @@
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <esp_idf_version.h>
+#include <esp_mac.h>
+#include <Preferences.h>
 #include <math.h>
 
 // ================= BOARD ROLE =================
-#define ROLE_HUB    0   // endpoint: prints the data stream as JSON over Serial
+#define ROLE_HUB    0   // endpoint: time authority, prints every reception as JSON over Serial
 #define ROLE_SENSOR 1   // ADXL345 sensor node
-#define ROLE_RELAY  2   // repeater + temporary hub (also prints JSON)
+#define ROLE_RELAY  2   // repeater (also prints JSON, usable as temporary hub)
 
 #define MY_ROLE ROLE_SENSOR   // <--- set per board before flashing
 
+#define PROTOCOL_VERSION 4
+#define FW_VERSION "4.0.0-dev"
+#define FW_MAJOR 4
 #define WIFI_CHANNEL 6
 #define DEV 1
-#define FW_VERSION "3.0.0-dev"
+#define MAX_HOPS 2
 // ==============================================
+
+// --- protocol: message kinds ---
+#define KIND_SYNC   0
+#define KIND_PING   1
+#define KIND_RANGE  2
+#define KIND_ALARM  3
+#define KIND_STATUS 4
+
+// --- protocol: wire structs. header + per-kind payload, variable length ---
+typedef struct __attribute__((packed)) {
+  uint8_t  version;
+  uint8_t  kind;
+  uint32_t origin;
+  uint16_t seq;        // per-node monotonic — identity is (origin, seq)
+  uint32_t forwarder;
+  uint8_t  hops;
+  uint32_t stamped;    // synced ms (hub: raw millis — it IS the authority)
+  uint16_t epoch;      // seq of the SYNC this node's clock derives from; 0 = never synced
+} MeshHeader;
+
+typedef struct __attribute__((packed)) { uint32_t authority; } SyncPayload;
+typedef struct __attribute__((packed)) { uint32_t peer; int8_t rssi; } RangePayload;
+typedef struct __attribute__((packed)) { float magnitude; float bearing; } AlarmPayload;
+typedef struct __attribute__((packed)) {
+  uint8_t  fw;
+  uint8_t  role;
+  uint16_t bootCount;
+  uint32_t uptimeS;
+  uint16_t syncAgeS;   // 0xFFFF = never synced, clamps at 0xFFFE
+  uint32_t tx;
+  uint32_t rx;
+  uint32_t drop;
+} StatusPayload;
+
+#define FRAME_MAX 64
+#define RSSI_SELF 127
+
+uint8_t payloadSize(uint8_t kind) {
+  switch (kind) {
+    case KIND_SYNC:   return sizeof(SyncPayload);
+    case KIND_PING:   return 0;
+    case KIND_RANGE:  return sizeof(RangePayload);
+    case KIND_ALARM:  return sizeof(AlarmPayload);
+    case KIND_STATUS: return sizeof(StatusPayload);
+    default:          return 0xFF;
+  }
+}
 
 // --- sensor config (ROLE_SENSOR only) ---
 #define I2C_SDA 8
@@ -24,20 +76,22 @@
 #define ADXL_ADDR 0x53
 const float VIBRATION_THRESHOLD = 0.20;
 float base_x = 0.0, base_y = 0.0, base_z = 1.0;
-float manual_direction = 90.0;
 
-// --- network state ---
+// --- node state ---
 uint32_t my_id = 0;
+uint16_t my_seq = 0;
 uint32_t sync_offset = 0;
-uint32_t last_msg_id = 0;
+uint16_t sync_epoch = 0;
 uint32_t last_sync_at = 0;
-uint32_t tx_count = 0, rx_count = 0, drop_count = 0;
+uint16_t boot_count = 0;
+uint32_t tx_count = 0, rx_count = 0, drop_count = 0, overflow_count = 0;
 
 uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 esp_now_peer_info_t peerInfo;
+Preferences prefs;
 
 // ================= LOGGING =================
-// Every serial line is JSON. Log lines carry "ev"; data lines keep the v1 schema.
+// Every serial line is JSON. Log lines carry "ev"; data lines carry "v":4.
 // LOG = state transitions and events, always on. TRACE = per-packet noise, DEV only.
 #define LOG(ev, fmt, ...) Serial.printf("{\"type\":\"log\",\"ev\":\"" ev "\",\"id\":\"%X\",\"t\":%lu" fmt "}\n", my_id, (unsigned long)millis(), ##__VA_ARGS__)
 
@@ -47,33 +101,71 @@ esp_now_peer_info_t peerInfo;
   #define TRACE(ev, fmt, ...)
 #endif
 
-typedef struct __attribute__((packed)) {
-  uint32_t msg_id;
-  uint32_t original_id;
-  uint32_t forwarder_id;
-  uint8_t  datatype;
-  uint32_t timestamp;
-  uint8_t  hop_count;
-  float    data_1;
-  float    data_2;
-} MeshPacket;
-
-MeshPacket myData;
-
-uint32_t generateMsgId() {
-  return (millis() & 0xFFFFFF) | (my_id << 24);
-}
-
+// ================= TIME =================
 uint32_t getSyncedTime() {
   return millis() - sync_offset;
 }
 
-// ================= ESP-NOW =================
-void sendPacket() {
-  esp_err_t err = esp_now_send(broadcastAddress, (uint8_t *) &myData, sizeof(myData));
+// ================= DEDUP =================
+// Bounded per-origin table. Wraparound-aware newer test; entries age out so a
+// rebooted node (fresh random seq) is accepted after AGE_MS of silence.
+#define SEEN_SLOTS 16
+#define SEEN_AGE_MS 60000
+#define RESEND_WINDOW_MS 5000
+#define VERDICT_NEW 0
+#define VERDICT_DUPE 1
+#define VERDICT_RESEND 2
+
+typedef struct { uint32_t origin; uint16_t seq; uint32_t at; } Seen;
+Seen seen[SEEN_SLOTS];
+
+uint8_t witness(uint32_t origin, uint16_t seq) {
+  uint32_t now = millis();
+  int slot = -1, oldest = 0;
+  for (int i = 0; i < SEEN_SLOTS; i++) {
+    if (seen[i].origin == origin) { slot = i; break; }
+    if (seen[i].at < seen[oldest].at) oldest = i;
+  }
+  if (slot == -1) {
+    seen[oldest] = { origin, seq, now };
+    return VERDICT_NEW;
+  }
+  Seen *entry = &seen[slot];
+  bool fresh = (int16_t)(seq - entry->seq) > 0;
+  bool aged = now - entry->at > SEEN_AGE_MS;
+  if (fresh || aged) {
+    entry->seq = seq;
+    entry->at = now;
+    return VERDICT_NEW;
+  }
+  if (seq == entry->seq && now - entry->at > RESEND_WINDOW_MS) {
+    entry->at = now;
+    return VERDICT_RESEND;
+  }
+  return VERDICT_DUPE;
+}
+
+// ================= TX =================
+uint8_t buildFrame(uint8_t kind, const void *payload, uint8_t size, uint8_t *out) {
+  if (++my_seq == 0) my_seq = 1;
+  MeshHeader header = { PROTOCOL_VERSION, kind, my_id, my_seq, my_id, 0, getSyncedTime(), sync_epoch };
+  memcpy(out, &header, sizeof(header));
+  if (size) memcpy(out + sizeof(header), payload, size);
+  return sizeof(header) + size;
+}
+
+void transmitFrame(const uint8_t *frame, uint8_t len) {
+  esp_err_t err = esp_now_send(broadcastAddress, (uint8_t *)frame, len);
   tx_count++;
-  if (err != ESP_OK) LOG("send_error", ",\"code\":%d,\"msgType\":%d", err, myData.datatype);
-  else TRACE("tx", ",\"msgType\":%d,\"msgId\":%u,\"time\":%u", myData.datatype, myData.msg_id, myData.timestamp);
+  const MeshHeader *header = (const MeshHeader *)frame;
+  if (err != ESP_OK) LOG("send_error", ",\"code\":%d,\"kind\":%d", err, header->kind);
+  else TRACE("tx", ",\"kind\":%d,\"seq\":%u,\"stamped\":%u", header->kind, header->seq, header->stamped);
+}
+
+void sendMesh(uint8_t kind, const void *payload, uint8_t size) {
+  uint8_t frame[FRAME_MAX];
+  uint8_t len = buildFrame(kind, payload, size, frame);
+  transmitFrame(frame, len);
 }
 
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 0)
@@ -84,100 +176,199 @@ void OnDataSent(const uint8_t *mac, esp_now_send_status_t status) {
   TRACE("tx_result", ",\"ok\":%d", status == ESP_NOW_SEND_SUCCESS);
 }
 
-void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
-  if (len != sizeof(MeshPacket)) {
-    drop_count++;
-    LOG("drop", ",\"why\":\"size\",\"len\":%d", len);
-    return;
-  }
+// --- alarm resend buffer: same frame (same seq, same stamped) re-broadcast blind ---
+#define PENDING_SLOTS 4
+typedef struct { uint8_t frame[FRAME_MAX]; uint8_t len; uint8_t left; uint32_t nextAt; } Pending;
+Pending pending[PENDING_SLOTS];
 
-  MeshPacket recvData;
-  memcpy(&recvData, incomingData, sizeof(recvData));
-
-  if (recvData.original_id == my_id) {
-    TRACE("drop", ",\"why\":\"own\",\"msgId\":%u", recvData.msg_id);
-    return;
-  }
-  if (recvData.msg_id == last_msg_id) {
-    drop_count++;
-    TRACE("drop", ",\"why\":\"dupe\",\"msgId\":%u", recvData.msg_id);
-    return;
-  }
-
-  last_msg_id = recvData.msg_id;
-  rx_count++;
-  int rssi = info->rx_ctrl->rssi;
-
-  TRACE("rx", ",\"msgType\":%d,\"orig\":\"%X\",\"fwd\":\"%X\",\"hops\":%d,\"rssi\":%d,\"time\":%u",
-        recvData.datatype, recvData.original_id, recvData.forwarder_id, recvData.hop_count, rssi, recvData.timestamp);
-
-  // --- DATA LINE (hub + relay) — v1 schema, the Pi parses this, do not change ---
-  if (MY_ROLE == ROLE_HUB || MY_ROLE == ROLE_RELAY) {
-    Serial.printf("{\"msg_id\":%u, \"orig_id\":\"%X\", \"fwd_id\":\"%X\", \"type\":%d, \"time\":%u, \"hops\":%d, \"d1\":%.2f, \"d2\":%.2f, \"rssi\":%d}\n",
-                  recvData.msg_id, recvData.original_id, recvData.forwarder_id, recvData.datatype,
-                  recvData.timestamp, recvData.hop_count, recvData.data_1, recvData.data_2, rssi);
-  }
-
-  // --- time sync ---
-  if (recvData.datatype == 0 && MY_ROLE == ROLE_SENSOR) {
-    uint32_t previous = sync_offset;
-    sync_offset = millis() - recvData.timestamp;
-    last_sync_at = millis();
-    LOG("sync", ",\"from\":\"%X\",\"offset\":%u,\"delta\":%ld", recvData.original_id, sync_offset, (long)(sync_offset - previous));
-  }
-
-  // --- relay forwarding ---
-  if (MY_ROLE == ROLE_RELAY && recvData.datatype != 0 && recvData.hop_count == 0) {
-    MeshPacket relayData = recvData;
-    relayData.forwarder_id = my_id;
-    relayData.hop_count += 1;
-
-    delay(5);
-    esp_now_send(broadcastAddress, (uint8_t *) &relayData, sizeof(relayData));
-    tx_count++;
-    TRACE("relay", ",\"msgType\":%d,\"orig\":\"%X\",\"msgId\":%u", relayData.datatype, relayData.original_id, relayData.msg_id);
-  }
-
-  // --- sensor: range reply to a heard ping ---
-  if (MY_ROLE == ROLE_SENSOR && recvData.datatype == 1) {
-    myData.msg_id = generateMsgId();
-    myData.original_id = my_id;
-    myData.forwarder_id = my_id;
-    myData.datatype = 2;
-    myData.timestamp = getSyncedTime();
-    myData.hop_count = 0;
-    myData.data_1 = rssi;
-    myData.data_2 = manual_direction;
-    sendPacket();
-    LOG("range", ",\"heard\":\"%X\",\"rssi\":%d", recvData.original_id, rssi);
+void schedule(const uint8_t *frame, uint8_t len, uint8_t repeats, uint32_t firstDelay) {
+  for (int i = 0; i < PENDING_SLOTS; i++) {
+    if (pending[i].left == 0) {
+      memcpy(pending[i].frame, frame, len);
+      pending[i].len = len;
+      pending[i].left = repeats;
+      pending[i].nextAt = millis() + firstDelay;
+      return;
+    }
   }
 }
 
-// ================= SENSOR INIT =================
+void drainPending() {
+  for (int i = 0; i < PENDING_SLOTS; i++) {
+    if (pending[i].left && millis() >= pending[i].nextAt) {
+      transmitFrame(pending[i].frame, pending[i].len);
+      pending[i].left--;
+      pending[i].nextAt = millis() + 800;
+    }
+  }
+}
+
+// ================= RX =================
+// Callback only validates size/version and enqueues. All work happens in loop().
+typedef struct { uint8_t bytes[FRAME_MAX]; uint8_t len; int8_t rssi; } RxSlot;
+#define RX_SLOTS 16
+RxSlot rxRing[RX_SLOTS];
+void processReception(const RxSlot *slot);
+volatile uint8_t rxHead = 0, rxTail = 0;
+
+void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
+  if (len < (int)sizeof(MeshHeader) || len > FRAME_MAX) { drop_count++; return; }
+  if (incomingData[0] != PROTOCOL_VERSION) { drop_count++; return; }
+  uint8_t next = (rxHead + 1) % RX_SLOTS;
+  if (next == rxTail) { overflow_count++; return; }
+  memcpy(rxRing[rxHead].bytes, incomingData, len);
+  rxRing[rxHead].len = len;
+  rxRing[rxHead].rssi = info->rx_ctrl->rssi;
+  rxHead = next;
+}
+
+void printReception(const MeshHeader *header, const uint8_t *payload, int8_t rssi) {
+  Serial.printf("{\"v\":%d,\"kind\":%d,\"origin\":\"%X\",\"seq\":%u,\"stamped\":%u,\"epoch\":%u,\"via\":\"%X\",\"hops\":%d",
+                header->version, header->kind, header->origin, header->seq, header->stamped, header->epoch,
+                header->forwarder, header->hops);
+  if (rssi != RSSI_SELF) Serial.printf(",\"rssi\":%d", rssi);
+  switch (header->kind) {
+    case KIND_SYNC: {
+      const SyncPayload *sync = (const SyncPayload *)payload;
+      Serial.printf(",\"authority\":%u", sync->authority);
+      break;
+    }
+    case KIND_RANGE: {
+      const RangePayload *range = (const RangePayload *)payload;
+      Serial.printf(",\"peer\":\"%X\",\"peerRssi\":%d", range->peer, range->rssi);
+      break;
+    }
+    case KIND_ALARM: {
+      const AlarmPayload *alarm = (const AlarmPayload *)payload;
+      Serial.printf(",\"mag\":%.2f,\"bearing\":%.1f", alarm->magnitude, alarm->bearing);
+      break;
+    }
+    case KIND_STATUS: {
+      const StatusPayload *status = (const StatusPayload *)payload;
+      Serial.printf(",\"fw\":%u,\"role\":%u,\"boots\":%u,\"up\":%u,\"syncAge\":%u,\"tx\":%u,\"rx\":%u,\"drop\":%u",
+                    status->fw, status->role, status->bootCount, status->uptimeS, status->syncAgeS,
+                    status->tx, status->rx, status->drop);
+      break;
+    }
+  }
+  Serial.printf("}\n");
+}
+
+void processReception(const RxSlot *slot) {
+  MeshHeader header;
+  memcpy(&header, slot->bytes, sizeof(header));
+  uint8_t expected = payloadSize(header.kind);
+  if (expected == 0xFF || slot->len != sizeof(header) + expected) {
+    drop_count++;
+    LOG("drop", ",\"why\":\"shape\",\"kind\":%d,\"len\":%d", header.kind, slot->len);
+    return;
+  }
+  if (header.origin == my_id) return;
+
+  rx_count++;
+  const uint8_t *payload = slot->bytes + sizeof(header);
+  uint8_t verdict = witness(header.origin, header.seq);
+
+  TRACE("rx", ",\"kind\":%d,\"origin\":\"%X\",\"seq\":%u,\"hops\":%d,\"rssi\":%d,\"verdict\":%d",
+        header.kind, header.origin, header.seq, header.hops, slot->rssi, verdict);
+
+  // hub + relay print EVERY reception, duplicates included — the Pi owns dedup
+  if (MY_ROLE == ROLE_HUB || MY_ROLE == ROLE_RELAY) printReception(&header, payload, slot->rssi);
+
+  // clock: any non-hub applies a SYNC — offset, epoch, both logged as a transition
+  if (header.kind == KIND_SYNC && MY_ROLE != ROLE_HUB) {
+    const SyncPayload *sync = (const SyncPayload *)payload;
+    uint32_t previous = sync_offset;
+    sync_offset = millis() - sync->authority;
+    sync_epoch = header.seq;
+    last_sync_at = millis();
+    LOG("sync", ",\"from\":\"%X\",\"epoch\":%u,\"offset\":%u,\"delta\":%ld",
+        header.origin, sync_epoch, sync_offset, (long)(sync_offset - previous));
+  }
+
+  // relay: forward anything new (or a blackout resend) that has hops left
+  if (MY_ROLE == ROLE_RELAY && verdict != VERDICT_DUPE && header.hops < MAX_HOPS) {
+    uint8_t frame[FRAME_MAX];
+    memcpy(frame, slot->bytes, slot->len);
+    MeshHeader *forwarded = (MeshHeader *)frame;
+    forwarded->forwarder = my_id;
+    forwarded->hops++;
+    transmitFrame(frame, slot->len);
+    TRACE("relay", ",\"kind\":%d,\"origin\":\"%X\",\"seq\":%u,\"hops\":%d",
+          forwarded->kind, forwarded->origin, forwarded->seq, forwarded->hops);
+  }
+
+  // sensor: a direct ping earns a range reply — direct only, so peer and rssi describe the same edge
+  if (MY_ROLE == ROLE_SENSOR && header.kind == KIND_PING && header.hops == 0 && verdict == VERDICT_NEW) {
+    delay(esp_random() % 20);
+    RangePayload range = { header.origin, slot->rssi };
+    sendMesh(KIND_RANGE, &range, sizeof(range));
+    LOG("range", ",\"peer\":\"%X\",\"rssi\":%d", header.origin, slot->rssi);
+  }
+}
+
+void drainRx() {
+  while (rxTail != rxHead) {
+    processReception((const RxSlot *)&rxRing[rxTail]);
+    rxTail = (rxTail + 1) % RX_SLOTS;
+  }
+  static uint16_t reported_overflow = 0;
+  if (overflow_count != reported_overflow) {
+    reported_overflow = overflow_count;
+    LOG("rx_overflow", ",\"total\":%u", overflow_count);
+  }
+}
+
+// ================= SENSOR =================
+bool readAccel(float *x, float *y, float *z) {
+  Wire.beginTransmission(ADXL_ADDR);
+  Wire.write(0x32);
+  Wire.endTransmission(false);
+  Wire.requestFrom(ADXL_ADDR, 6);
+  if (Wire.available() < 6) return false;
+  *x = (int16_t)(Wire.read() | (Wire.read() << 8)) / 256.0;
+  *y = (int16_t)(Wire.read() | (Wire.read() << 8)) / 256.0;
+  *z = (int16_t)(Wire.read() | (Wire.read() << 8)) / 256.0;
+  return true;
+}
+
 void calibrateBaseline() {
   LOG("calibrating", "");
-  float sum_x = 0, sum_y = 0, sum_z = 0;
+  float sum_x = 0, sum_y = 0, sum_z = 0, x, y, z;
   int samples = 100, good = 0;
   for (int i = 0; i < samples; i++) {
-    Wire.beginTransmission(ADXL_ADDR);
-    Wire.write(0x32);
-    Wire.endTransmission(false);
-    Wire.requestFrom(ADXL_ADDR, 6);
-    if (Wire.available() >= 6) {
-      sum_x += (int16_t)(Wire.read() | (Wire.read() << 8)) / 256.0;
-      sum_y += (int16_t)(Wire.read() | (Wire.read() << 8)) / 256.0;
-      sum_z += (int16_t)(Wire.read() | (Wire.read() << 8)) / 256.0;
-      good++;
-    }
+    if (readAccel(&x, &y, &z)) { sum_x += x; sum_y += y; sum_z += z; good++; }
     delay(20);
   }
-  base_x = sum_x / samples; base_y = sum_y / samples; base_z = sum_z / samples;
+  if (good > 0) { base_x = sum_x / good; base_y = sum_y / good; base_z = sum_z / good; }
   LOG("calibrated", ",\"good\":%d,\"of\":%d,\"x\":%.3f,\"y\":%.3f,\"z\":%.3f", good, samples, base_x, base_y, base_z);
 }
 
+// ================= STATUS =================
+void sendStatus() {
+  StatusPayload status = {
+    FW_MAJOR, MY_ROLE, boot_count, millis() / 1000,
+    (uint16_t)(last_sync_at ? min((millis() - last_sync_at) / 1000, 0xFFFEUL) : 0xFFFF),
+    tx_count, rx_count, drop_count,
+  };
+  if (MY_ROLE == ROLE_HUB) {
+    uint8_t frame[FRAME_MAX];
+    uint8_t len = buildFrame(KIND_STATUS, &status, sizeof(status), frame);
+    printReception((const MeshHeader *)frame, frame + sizeof(MeshHeader), RSSI_SELF);
+    transmitFrame(frame, len);
+  } else {
+    sendMesh(KIND_STATUS, &status, sizeof(status));
+  }
+}
+
+// ================= LIFECYCLE =================
 void setup() {
   Serial.begin(115200);
   delay(1000);
+
+  prefs.begin("stucatch", false);
+  boot_count = prefs.getUShort("boots", 0) + 1;
+  prefs.putUShort("boots", boot_count);
 
   uint8_t mac[6];
   WiFi.persistent(false);
@@ -185,11 +376,12 @@ void setup() {
   WiFi.disconnect(false, true);
   esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
   esp_wifi_set_ps(WIFI_PS_NONE);
-  WiFi.setTxPower(WIFI_POWER_8_5dBm);
-  WiFi.macAddress(mac);
+  esp_read_mac(mac, ESP_MAC_WIFI_STA);
   my_id = (mac[2] << 24) | (mac[3] << 16) | (mac[4] << 8) | mac[5];
+  my_seq = esp_random();
 
-  LOG("boot", ",\"fw\":\"" FW_VERSION "\",\"role\":%d,\"channel\":%d,\"txPower\":%d,\"dev\":%d", MY_ROLE, WIFI_CHANNEL, (int)WiFi.getTxPower(), DEV);
+  LOG("boot", ",\"fw\":\"" FW_VERSION "\",\"protocol\":%d,\"role\":%d,\"boots\":%u,\"channel\":%d,\"dev\":%d",
+      PROTOCOL_VERSION, MY_ROLE, boot_count, WIFI_CHANNEL, DEV);
 
   if (esp_now_init() != ESP_OK) {
     LOG("espnow_init_failed", "");
@@ -205,7 +397,8 @@ void setup() {
     LOG("peer_add_failed", "");
     return;
   }
-  LOG("espnow_ready", "");
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);
+  LOG("espnow_ready", ",\"txPower\":%d", (int)WiFi.getTxPower());
 
   if (MY_ROLE == ROLE_SENSOR) {
     Wire.begin(I2C_SDA, I2C_SCL);
@@ -218,75 +411,63 @@ void setup() {
 }
 
 void loop() {
-  // --- hub + relay broadcast time sync ---
-  if (MY_ROLE == ROLE_HUB || MY_ROLE == ROLE_RELAY) {
+  drainRx();
+  drainPending();
+
+  // hub: sole time authority — sync every 10s; epoch IS this frame's seq
+  if (MY_ROLE == ROLE_HUB) {
     static unsigned long last_sync = 0;
     if (millis() - last_sync > 10000) {
-      myData.msg_id = generateMsgId();
-      myData.original_id = my_id;
-      myData.forwarder_id = my_id;
-      myData.datatype = 0;
-      myData.timestamp = millis();
-      myData.hop_count = 0;
-      myData.data_1 = 0; myData.data_2 = 0;
-      sendPacket();
+      SyncPayload sync = { millis() };
+      sendMesh(KIND_SYNC, &sync, sizeof(sync));
+      sync_epoch = my_seq;
       last_sync = millis();
     }
   }
 
-#if DEV
+  // all roles: status heartbeat every 30s
   static unsigned long last_status = 0;
-  if (millis() - last_status > 10000) {
-    LOG("status", ",\"up\":%lu,\"syncAge\":%ld,\"tx\":%u,\"rx\":%u,\"drop\":%u,\"heap\":%u",
-        millis() / 1000, last_sync_at ? (long)(millis() - last_sync_at) : -1L, tx_count, rx_count, drop_count, (unsigned)ESP.getFreeHeap());
-    if (MY_ROLE == ROLE_SENSOR) LOG("baseline", ",\"x\":%.3f,\"y\":%.3f,\"z\":%.3f", base_x, base_y, base_z);
+  if (millis() - last_status > 30000) {
+    sendStatus();
     last_status = millis();
+  }
+
+#if DEV
+  static unsigned long last_devlog = 0;
+  if (millis() - last_devlog > 10000) {
+    LOG("status", ",\"up\":%lu,\"syncAge\":%ld,\"epoch\":%u,\"tx\":%u,\"rx\":%u,\"drop\":%u,\"overflow\":%u,\"heap\":%u",
+        millis() / 1000, last_sync_at ? (long)((millis() - last_sync_at) / 1000) : -1L,
+        sync_epoch, tx_count, rx_count, drop_count, overflow_count, (unsigned)ESP.getFreeHeap());
+    if (MY_ROLE == ROLE_SENSOR) LOG("baseline", ",\"x\":%.3f,\"y\":%.3f,\"z\":%.3f", base_x, base_y, base_z);
+    last_devlog = millis();
   }
 #endif
 
   if (MY_ROLE == ROLE_SENSOR) {
     static unsigned long last_ping = 0;
     if (millis() - last_ping > 5000) {
-      myData.msg_id = generateMsgId();
-      myData.original_id = my_id;
-      myData.forwarder_id = my_id;
-      myData.datatype = 1;
-      myData.timestamp = getSyncedTime();
-      myData.hop_count = 0;
-      sendPacket();
+      sendMesh(KIND_PING, NULL, 0);
       last_ping = millis();
     }
 
     static bool i2c_ok = true;
-    Wire.beginTransmission(ADXL_ADDR);
-    Wire.write(0x32);
-    Wire.endTransmission(false);
-    Wire.requestFrom(ADXL_ADDR, 6);
-    if (Wire.available() >= 6) {
+    float x, y, z;
+    if (readAccel(&x, &y, &z)) {
       if (!i2c_ok) { i2c_ok = true; LOG("i2c_recovered", ""); }
-      float x = (int16_t)(Wire.read() | (Wire.read() << 8)) / 256.0;
-      float y = (int16_t)(Wire.read() | (Wire.read() << 8)) / 256.0;
-      float z = (int16_t)(Wire.read() | (Wire.read() << 8)) / 256.0;
 
-      float dx = x - base_x; float dy = y - base_y; float dz = z - base_z;
-      float delta_magnitude = sqrt(dx*dx + dy*dy + dz*dz);
+      float dx = x - base_x, dy = y - base_y, dz = z - base_z;
+      float delta_magnitude = sqrt(dx * dx + dy * dy + dz * dz);
 
       if (delta_magnitude >= VIBRATION_THRESHOLD) {
-        float angle_rad = atan2(dy, dx);
-        float angle_deg = angle_rad * 180.0 / PI;
+        float angle_deg = atan2(dy, dx) * 180.0 / PI;
         if (angle_deg < 0) angle_deg += 360.0;
 
-        myData.msg_id = generateMsgId();
-        myData.original_id = my_id;
-        myData.forwarder_id = my_id;
-        myData.datatype = 3;
-        myData.timestamp = getSyncedTime();
-        myData.hop_count = 0;
-        myData.data_1 = delta_magnitude;
-        myData.data_2 = angle_deg;
-
-        sendPacket();
-        LOG("alarm", ",\"mag\":%.2f,\"bearing\":%.1f", delta_magnitude, angle_deg);
+        AlarmPayload alarm = { delta_magnitude, angle_deg };
+        uint8_t frame[FRAME_MAX];
+        uint8_t len = buildFrame(KIND_ALARM, &alarm, sizeof(alarm), frame);
+        transmitFrame(frame, len);
+        schedule(frame, len, 2, 200);
+        LOG("alarm", ",\"mag\":%.2f,\"bearing\":%.1f,\"seq\":%u", delta_magnitude, angle_deg, my_seq);
         delay(200);
       } else {
         base_x = base_x * 0.995 + x * 0.005;
