@@ -30,8 +30,8 @@
 #define DEV 1                 // 1 = per-packet tx/rx/relay traces + 10s status logs; 0 compiles them out. Data + state-transition lines print either way
 
 #define PROTOCOL_VERSION 4
-#define FW_VERSION "4.0.0-dev"
-#define FW_MAJOR 4
+#define FW_VERSION "6.0.0-dev"
+#define FW_MAJOR 6
 #define WIFI_CHANNEL 6
 #define MAX_HOPS 2
 // ==============================================
@@ -88,6 +88,14 @@ uint8_t payloadSize(uint8_t kind) {
 #define I2C_SCL 9
 #define ADXL_ADDR 0x53
 const float VIBRATION_THRESHOLD = 0.20;
+// The first sample over threshold is the rising edge of a 10–50ms transient, not
+// its peak. After a crossing, keep sampling for this long and report the window's
+// peak magnitude and an energy-weighted bearing instead of the edge sample.
+#define ALARM_WINDOW_MS 30
+// Max per-axis drift across the window for a crossing to count as a tilt rather
+// than an impact. 0.12g admits slow reorientation (~200°/s over 30ms) while
+// impact ringing (±0.2g+ swings) blows past it.
+#define TILT_JITTER 0.12
 float base_x = 0.0, base_y = 0.0, base_z = 1.0;
 
 // --- node state ---
@@ -424,6 +432,9 @@ void setup() {
     delay(100);
     Wire.beginTransmission(ADXL_ADDR); Wire.write(0x2D); Wire.write(0x08); Wire.endTransmission();
     Wire.beginTransmission(ADXL_ADDR); Wire.write(0x31); Wire.write(0x0B); Wire.endTransmission();
+    // BW_RATE 400Hz: at the default 100Hz ODR a 30ms alarm window holds ~3 fresh
+    // samples; 400Hz gives ~12. The idle loop still polls at ~100Hz via delay(10).
+    Wire.beginTransmission(ADXL_ADDR); Wire.write(0x2C); Wire.write(0x0C); Wire.endTransmission();
     calibrateBaseline();
   }
   LOG("ready", "");
@@ -477,31 +488,69 @@ void loop() {
       float dx = x - base_x, dy = y - base_y, dz = z - base_z;
       float delta_magnitude = sqrt(dx * dx + dy * dy + dz * dz);
 
-      // Determine the overall gravity force to see if this is just a tilt
-      float total_g = sqrt(x * x + y * y + z * z);
-      bool is_just_tilt = (fabs(total_g - 1.0) < 0.2) && (delta_magnitude >= VIBRATION_THRESHOLD);
+      if (delta_magnitude >= VIBRATION_THRESHOLD) {
+        // A crossing is either an impact or the board settling into a new
+        // orientation, and one sample cannot tell them apart: impact ringing
+        // passes through |a|≈1g (a purely horizontal hit sits inside the band up
+        // to ~0.66g), and snapping the baseline on such a sample both eats the
+        // alarm and corrupts the rest of the event. Decide over the capture
+        // window instead — a tilted board is at REST in its new orientation
+        // (every sample near 1g and within TILT_JITTER of the first), an impact
+        // rings and violates one or the other.
+        float first_x = x, first_y = y, first_z = z;
+        bool at_rest = fabs(sqrt(x * x + y * y + z * z) - 1.0) < 0.2;
 
-      if (is_just_tilt) {
-        // If it's just a change in spatial orientation (e.g., turning upside down),
-        // rapidly reset the baseline to the new position and do NOT send any alarms to the hub
-        base_x = x;
-        base_y = y;
-        base_z = z;
-      } 
-      else if (delta_magnitude >= VIBRATION_THRESHOLD) {
-        // This is a real vibration or sharp shock
-        // Correct the azimuth for upside-down orientation
-        float effective_dy = (base_z < 0) ? -dy : dy;
-        float angle_deg = atan2(effective_dy, dx) * 180.0 / PI;
-        if (angle_deg < 0) angle_deg += 360.0;
+        // Capture: peak magnitude beats the edge sample, and weighting each
+        // sample's horizontal direction by its energy (mag²) lets the loud part
+        // of the transient set the bearing instead of one noisy point. Baseline
+        // stays frozen for the duration.
+        float peak = delta_magnitude, peak_hor = sqrt(dx * dx + dy * dy), peak_vert = fabs(dz);
+        float energy = delta_magnitude * delta_magnitude;
+        float wx = energy * dx, wy = energy * dy;
+        uint32_t window_start = millis();
+        while (millis() - window_start < ALARM_WINDOW_MS) {
+          delay(2);
+          if (!readAccel(&x, &y, &z)) continue;
+          if (at_rest && (fabs(sqrt(x * x + y * y + z * z) - 1.0) >= 0.2 ||
+                          fabs(x - first_x) > TILT_JITTER ||
+                          fabs(y - first_y) > TILT_JITTER ||
+                          fabs(z - first_z) > TILT_JITTER)) at_rest = false;
+          dx = x - base_x; dy = y - base_y; dz = z - base_z;
+          float mag = sqrt(dx * dx + dy * dy + dz * dz);
+          energy = mag * mag;
+          wx += energy * dx;
+          wy += energy * dy;
+          if (mag > peak) {
+            peak = mag;
+            peak_hor = sqrt(dx * dx + dy * dy);
+            peak_vert = fabs(dz);
+          }
+        }
 
-        AlarmPayload alarm = { delta_magnitude, angle_deg };
-        uint8_t frame[FRAME_MAX];
-        uint8_t len = buildFrame(KIND_ALARM, &alarm, sizeof(alarm), frame);
-        transmitFrame(frame, len);
-        schedule(frame, len, 2, 200);
-        LOG("alarm", ",\"mag\":%.2f,\"bearing\":%.1f,\"seq\":%u", delta_magnitude, angle_deg, my_seq);
-        delay(200);
+        if (at_rest) {
+          // Held steady off-baseline for the whole window: a reorientation
+          // (e.g. turned upside down). Adopt it, send nothing to the hub.
+          base_x = x;
+          base_y = y;
+          base_z = z;
+          LOG("tilt", ",\"x\":%.3f,\"y\":%.3f,\"z\":%.3f", x, y, z);
+        } else {
+          // Correct the azimuth for upside-down orientation
+          float effective_wy = (base_z < 0) ? -wy : wy;
+          float angle_deg = atan2(effective_wy, wx) * 180.0 / PI;
+          if (angle_deg < 0) angle_deg += 360.0;
+
+          AlarmPayload alarm = { peak, angle_deg };
+          uint8_t frame[FRAME_MAX];
+          uint8_t len = buildFrame(KIND_ALARM, &alarm, sizeof(alarm), frame);
+          transmitFrame(frame, len);
+          schedule(frame, len, 2, 200);
+          // hor/vert are the peak sample's horizontal vs vertical split — serial-only
+          // diagnostic for how much of the impact the bearing plane actually sees.
+          LOG("alarm", ",\"mag\":%.2f,\"bearing\":%.1f,\"hor\":%.2f,\"vert\":%.2f,\"seq\":%u",
+              peak, angle_deg, peak_hor, peak_vert, my_seq);
+          delay(200);
+        }
       } else {
         // Standard resting state — slowly update the baseline
         base_x = base_x * 0.995 + x * 0.005;

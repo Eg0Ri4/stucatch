@@ -72,7 +72,7 @@ frame sizes:   SYNC 23 · PING 19 · RANGE 24 · ALARM 27 · STATUS 41   (ESP-NO
 | 0 | SYNC | hub only | every 10 s | `authority` u32 — hub clock, ms |
 | 1 | PING | sensors | every 5 s | — |
 | 2 | RANGE | sensors | on hearing a *direct* PING | `peer` u32, `rssi` i8 — "I heard `peer`'s ping this loud" |
-| 3 | ALARM | sensors | vibration ≥ 0.20 g (then 200 ms cooldown) | `magnitude` f32 (g), `bearing` f32 (degrees, **sensor's own frame**) |
+| 3 | ALARM | sensors | vibration ≥ 0.20 g (then 200 ms cooldown) | `magnitude` f32 (g, **peak** over a 30 ms capture window), `bearing` f32 (degrees, **sensor's own frame**, energy-weighted over the window) |
 | 4 | STATUS | all | every 30 s | `fw` u8, `role` u8, `bootCount` u16, `uptimeS` u32, `syncAgeS` u16, `tx` u32, `rx` u32, `drop` u32 |
 
 As the hub prints them (one NDJSON line per reception):
@@ -137,7 +137,7 @@ loop() drainRx():        shape check (len == header + payload for kind)
 | 5 s | sensors | broadcast PING |
 | 30 s | all | broadcast STATUS (hub also prints its own) |
 | 10 s | all, `DEV` only | LOG status + baseline |
-| ~10 ms | sensors | read ADXL, compare against drifting baseline (EMA 0.995), fire ALARM on ≥ 0.20 g |
+| ~10 ms | sensors | read ADXL, compare against drifting baseline (EMA 0.995); on ≥ 0.20 g capture a 30 ms window (peak mag + energy-weighted bearing; the `alarm` log line adds the peak's `hor`/`vert` split), then fire ALARM. A near-1 g total with a big delta is a tilt: baseline snaps, no alarm |
 | pending | sensors | re-broadcast buffered alarm frames (same seq) |
 
 ### Serial contract
