@@ -1,0 +1,430 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include <esp_idf_version.h>
+#include <math.h>
+#include <stddef.h>
+#include "mbedtls/md.h"
+
+// ================= BOARD ROLE =================
+#define ROLE_HUB    0   // endpoint: prints the data stream as JSON over Serial
+#define ROLE_SENSOR 1   // ADXL345 sensor node
+#define ROLE_RELAY  2   // repeater + temporary hub (also prints JSON)
+
+#define MY_ROLE ROLE_SENSOR   // <--- set per board before flashing
+
+#define WIFI_CHANNEL 6
+#define DEV 1
+#define FW_VERSION "3.1.0-sec"
+
+// ================= SECURITY LAYER =================
+// SECURE_MESH 1 -> every packet carries an 8-byte HMAC-SHA256 tag over its
+// immutable part; nodes drop anything that does not verify, plus a per-node
+// sequence counter rejects replayed frames. Set to 0 to fall back to the plain
+// mesh (still needs the whole fleet reflashed - the struct size differs).
+// Flash EVERY board with the SAME SECURE_MESH value and the SAME MESH_KEY.
+#define SECURE_MESH 1
+
+#define PROTO_VERSION 3
+#define AUTH_LEN      8
+#define REPLAY_RESET_SEQ 10   // a low seq after a higher one = the node rebooted
+
+#if SECURE_MESH
+// 16-byte pre-shared key. CHANGE THIS before the event, keep it identical on
+// every board. (It lives in flash: a stolen board leaks it. eFuse is the real
+// fix, out of scope for the weekend.)
+static const uint8_t MESH_KEY[16] = {
+  0x8C, 0x41, 0xD9, 0x2B, 0x0F, 0x77, 0xA5, 0x63,
+  0x1E, 0xB0, 0x4A, 0xF2, 0x59, 0x86, 0x3D, 0xC7
+};
+#endif
+// ==============================================
+
+// --- sensor config (ROLE_SENSOR only) ---
+#define I2C_SDA 8
+#define I2C_SCL 9
+#define ADXL_ADDR 0x53
+const float VIBRATION_THRESHOLD = 0.20;
+float base_x = 0.0, base_y = 0.0, base_z = 1.0;
+float manual_direction = 90.0;
+
+// --- network state ---
+uint32_t my_id = 0;
+uint32_t sync_offset = 0;
+uint32_t tx_seq = 0;                 // per-node send counter, resets each boot
+uint32_t last_sync_at = 0;
+uint32_t tx_count = 0, rx_count = 0, drop_count = 0;
+
+uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+esp_now_peer_info_t peerInfo;
+
+// ================= LOGGING =================
+// Every serial line is JSON. Log lines carry "ev"; data lines keep the v1 schema.
+// LOG = state transitions and events, always on. TRACE = per-packet noise, DEV only.
+#define LOG(ev, fmt, ...) Serial.printf("{\"type\":\"log\",\"ev\":\"" ev "\",\"id\":\"%X\",\"t\":%lu" fmt "}\n", my_id, (unsigned long)millis(), ##__VA_ARGS__)
+
+#if DEV
+  #define TRACE LOG
+#else
+  #define TRACE(ev, fmt, ...)
+#endif
+
+// ---- packet ----
+// packed  -> identical byte layout on every board
+// aligned -> instances sit on a 4-byte boundary (clean float access on RISC-V)
+// The signed region is everything up to forwarder_id: the origin sets it and it
+// never changes in transit, so the relay can still rewrite forwarder_id /
+// hop_count without breaking the origin's tag.
+typedef struct __attribute__((packed, aligned(4))) {
+  uint8_t  version;       // PROTO_VERSION
+  uint8_t  datatype;
+  uint16_t _pad;          // stays 0 - it is inside the signed region
+  uint32_t seq;           // per-node counter (see tx_seq)
+  uint32_t msg_id;
+  uint32_t original_id;
+  uint32_t timestamp;
+  float    data_1;
+  float    data_2;
+  // ---- mutable in transit, NOT signed ----
+  uint32_t forwarder_id;
+  uint8_t  hop_count;
+  uint8_t  _rsv[3];
+#if SECURE_MESH
+  uint8_t  auth[AUTH_LEN];
+#endif
+} MeshPacket;
+
+MeshPacket myData;
+
+#if SECURE_MESH
+#define SIGNED_LEN offsetof(MeshPacket, forwarder_id)
+
+static void computeAuth(const MeshPacket *p, uint8_t out[AUTH_LEN]) {
+  uint8_t full[32];
+  mbedtls_md_hmac(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
+                  MESH_KEY, sizeof(MESH_KEY),
+                  (const uint8_t *) p, SIGNED_LEN, full);
+  memcpy(out, full, AUTH_LEN);
+}
+
+static bool authOK(const MeshPacket *p) {
+  uint8_t want[AUTH_LEN];
+  computeAuth(p, want);
+  uint8_t diff = 0;                       // constant-time compare
+  for (int i = 0; i < AUTH_LEN; i++) diff |= (uint8_t)(want[i] ^ p->auth[i]);
+  return diff == 0;
+}
+#endif
+
+// ---- dedup ring: the last N (origin, seq) pairs we have already processed ----
+#define SEEN_N 32
+static struct { uint32_t id; uint32_t seq; } seen[SEEN_N];
+static uint8_t seen_head = 0;
+
+static bool seenBefore(uint32_t id, uint32_t seq) {
+  for (int i = 0; i < SEEN_N; i++)
+    if (seen[i].id == id && seen[i].seq == seq) return true;
+  return false;
+}
+static void seenPut(uint32_t id, uint32_t seq) {
+  seen[seen_head].id = id;
+  seen[seen_head].seq = seq;
+  seen_head = (seen_head + 1) % SEEN_N;
+}
+
+uint32_t generateMsgId() {
+  return (millis() & 0xFFFFFF) | (my_id << 24);
+}
+
+uint32_t getSyncedTime() {
+  return millis() - sync_offset;
+}
+
+// ================= ESP-NOW =================
+void sendPacket() {
+  myData.version = PROTO_VERSION;
+  myData._pad    = 0;
+  myData.seq     = ++tx_seq;
+#if SECURE_MESH
+  computeAuth(&myData, myData.auth);
+#endif
+  esp_err_t err = esp_now_send(broadcastAddress, (uint8_t *) &myData, sizeof(myData));
+  tx_count++;
+  if (err != ESP_OK) LOG("send_error", ",\"code\":%d,\"msgType\":%d", err, myData.datatype);
+  else TRACE("tx", ",\"msgType\":%d,\"seq\":%u,\"time\":%u", myData.datatype, myData.seq, myData.timestamp);
+}
+
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 0)
+void OnDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
+#else
+void OnDataSent(const uint8_t *mac, esp_now_send_status_t status) {
+#endif
+  TRACE("tx_result", ",\"ok\":%d", status == ESP_NOW_SEND_SUCCESS);
+}
+
+void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
+  if (len != sizeof(MeshPacket)) {
+    drop_count++;
+    LOG("drop", ",\"why\":\"size\",\"len\":%d", len);
+    return;
+  }
+
+  MeshPacket recvData;
+  memcpy(&recvData, incomingData, sizeof(recvData));
+
+  if (recvData.version != PROTO_VERSION) {
+    drop_count++;
+    TRACE("drop", ",\"why\":\"version\",\"v\":%d", recvData.version);
+    return;
+  }
+
+#if SECURE_MESH
+  if (!authOK(&recvData)) {
+    drop_count++;
+    LOG("drop", ",\"why\":\"auth\",\"orig\":\"%X\",\"seq\":%u", recvData.original_id, recvData.seq);
+    return;
+  }
+#endif
+
+  if (recvData.original_id == my_id) {
+    TRACE("drop", ",\"why\":\"own\",\"seq\":%u", recvData.seq);
+    return;
+  }
+
+  // dedup: relayed copies and mesh echoes carry the same (origin, seq)
+  if (seenBefore(recvData.original_id, recvData.seq)) {
+    drop_count++;
+    TRACE("drop", ",\"why\":\"dupe\",\"orig\":\"%X\",\"seq\":%u", recvData.original_id, recvData.seq);
+    return;
+  }
+  seenPut(recvData.original_id, recvData.seq);
+
+#if SECURE_MESH
+  // replay rejection: seq must move forward per origin. A big jump backwards is
+  // a reboot (seq restarts at 1), not a replay - accept and rebase, but log it.
+  {
+    static struct { uint32_t id; uint32_t last_seq; } track[8];
+    static uint8_t track_n = 0;
+    int idx = -1;
+    for (int i = 0; i < track_n; i++)
+      if (track[i].id == recvData.original_id) { idx = i; break; }
+
+    if (idx < 0) {
+      if (track_n < 8) { track[track_n].id = recvData.original_id;
+                         track[track_n].last_seq = recvData.seq; track_n++; }
+    } else if (recvData.seq > track[idx].last_seq) {
+      track[idx].last_seq = recvData.seq;
+    } else if (recvData.seq <= REPLAY_RESET_SEQ) {
+      // seq restarted from the bottom -> the node rebooted, not a replay
+      LOG("peer_reboot", ",\"orig\":\"%X\",\"seq\":%u,\"was\":%u",
+          recvData.original_id, recvData.seq, track[idx].last_seq);
+      track[idx].last_seq = recvData.seq;
+    } else {
+      drop_count++;
+      LOG("drop", ",\"why\":\"replay\",\"orig\":\"%X\",\"seq\":%u,\"last\":%u",
+          recvData.original_id, recvData.seq, track[idx].last_seq);
+      return;
+    }
+  }
+#endif
+
+  rx_count++;
+  int rssi = info->rx_ctrl->rssi;
+
+  TRACE("rx", ",\"msgType\":%d,\"orig\":\"%X\",\"fwd\":\"%X\",\"hops\":%d,\"rssi\":%d,\"seq\":%u",
+        recvData.datatype, recvData.original_id, recvData.forwarder_id, recvData.hop_count, rssi, recvData.seq);
+
+  // --- DATA LINE (hub + relay) — v1 schema, the Pi parses this, do not change ---
+  if (MY_ROLE == ROLE_HUB || MY_ROLE == ROLE_RELAY) {
+    Serial.printf("{\"msg_id\":%u, \"orig_id\":\"%X\", \"fwd_id\":\"%X\", \"type\":%d, \"time\":%u, \"hops\":%d, \"d1\":%.2f, \"d2\":%.2f, \"rssi\":%d}\n",
+                  recvData.msg_id, recvData.original_id, recvData.forwarder_id, recvData.datatype,
+                  recvData.timestamp, recvData.hop_count, recvData.data_1, recvData.data_2, rssi);
+  }
+
+  // --- time sync ---
+  if (recvData.datatype == 0 && MY_ROLE == ROLE_SENSOR) {
+    uint32_t previous = sync_offset;
+    sync_offset = millis() - recvData.timestamp;
+    last_sync_at = millis();
+    LOG("sync", ",\"from\":\"%X\",\"offset\":%u,\"delta\":%ld", recvData.original_id, sync_offset, (long)(sync_offset - previous));
+  }
+
+  // --- relay forwarding ---
+  // forwarder_id / hop_count are outside the signed region, so the tag stays valid.
+  if (MY_ROLE == ROLE_RELAY && recvData.datatype != 0 && recvData.hop_count == 0) {
+    MeshPacket relayData = recvData;
+    relayData.forwarder_id = my_id;
+    relayData.hop_count += 1;
+
+    delay(5);
+    esp_now_send(broadcastAddress, (uint8_t *) &relayData, sizeof(relayData));
+    tx_count++;
+    TRACE("relay", ",\"msgType\":%d,\"orig\":\"%X\",\"seq\":%u", relayData.datatype, relayData.original_id, relayData.seq);
+  }
+
+  // --- sensor: range reply to a heard ping ---
+  if (MY_ROLE == ROLE_SENSOR && recvData.datatype == 1) {
+    myData.msg_id = generateMsgId();
+    myData.original_id = my_id;
+    myData.forwarder_id = my_id;
+    myData.datatype = 2;
+    myData.timestamp = getSyncedTime();
+    myData.hop_count = 0;
+    myData.data_1 = rssi;
+    myData.data_2 = manual_direction;
+    sendPacket();
+    LOG("range", ",\"heard\":\"%X\",\"rssi\":%d", recvData.original_id, rssi);
+  }
+}
+
+// ================= SENSOR INIT =================
+void calibrateBaseline() {
+  LOG("calibrating", "");
+  float sum_x = 0, sum_y = 0, sum_z = 0;
+  int samples = 100, good = 0;
+  for (int i = 0; i < samples; i++) {
+    Wire.beginTransmission(ADXL_ADDR);
+    Wire.write(0x32);
+    Wire.endTransmission(false);
+    Wire.requestFrom(ADXL_ADDR, 6);
+    if (Wire.available() >= 6) {
+      sum_x += (int16_t)(Wire.read() | (Wire.read() << 8)) / 256.0;
+      sum_y += (int16_t)(Wire.read() | (Wire.read() << 8)) / 256.0;
+      sum_z += (int16_t)(Wire.read() | (Wire.read() << 8)) / 256.0;
+      good++;
+    }
+    delay(20);
+  }
+  base_x = sum_x / samples; base_y = sum_y / samples; base_z = sum_z / samples;
+  LOG("calibrated", ",\"good\":%d,\"of\":%d,\"x\":%.3f,\"y\":%.3f,\"z\":%.3f", good, samples, base_x, base_y, base_z);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  uint8_t mac[6];
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(false, true);
+  esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);
+  WiFi.macAddress(mac);
+  my_id = (mac[2] << 24) | (mac[3] << 16) | (mac[4] << 8) | mac[5];
+
+  LOG("boot", ",\"fw\":\"" FW_VERSION "\",\"role\":%d,\"channel\":%d,\"secure\":%d,\"txPower\":%d,\"dev\":%d",
+      MY_ROLE, WIFI_CHANNEL, SECURE_MESH, (int)WiFi.getTxPower(), DEV);
+
+  if (esp_now_init() != ESP_OK) {
+    LOG("espnow_init_failed", "");
+    return;
+  }
+  esp_now_register_recv_cb(OnDataRecv);
+  esp_now_register_send_cb(OnDataSent);
+
+  memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+  peerInfo.channel = WIFI_CHANNEL;
+  peerInfo.encrypt = false;
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    LOG("peer_add_failed", "");
+    return;
+  }
+  LOG("espnow_ready", "");
+
+  if (MY_ROLE == ROLE_SENSOR) {
+    Wire.begin(I2C_SDA, I2C_SCL);
+    delay(100);
+    Wire.beginTransmission(ADXL_ADDR); Wire.write(0x2D); Wire.write(0x08); Wire.endTransmission();
+    Wire.beginTransmission(ADXL_ADDR); Wire.write(0x31); Wire.write(0x0B); Wire.endTransmission();
+    calibrateBaseline();
+  }
+  LOG("ready", "");
+}
+
+void loop() {
+  // --- hub + relay broadcast time sync ---
+  if (MY_ROLE == ROLE_HUB || MY_ROLE == ROLE_RELAY) {
+    static unsigned long last_sync = 0;
+    if (millis() - last_sync > 10000) {
+      myData.msg_id = generateMsgId();
+      myData.original_id = my_id;
+      myData.forwarder_id = my_id;
+      myData.datatype = 0;
+      myData.timestamp = millis();
+      myData.hop_count = 0;
+      myData.data_1 = 0; myData.data_2 = 0;
+      sendPacket();
+      last_sync = millis();
+    }
+  }
+
+#if DEV
+  static unsigned long last_status = 0;
+  if (millis() - last_status > 10000) {
+    LOG("status", ",\"up\":%lu,\"syncAge\":%ld,\"tx\":%u,\"rx\":%u,\"drop\":%u,\"heap\":%u",
+        millis() / 1000, last_sync_at ? (long)(millis() - last_sync_at) : -1L, tx_count, rx_count, drop_count, (unsigned)ESP.getFreeHeap());
+    if (MY_ROLE == ROLE_SENSOR) LOG("baseline", ",\"x\":%.3f,\"y\":%.3f,\"z\":%.3f", base_x, base_y, base_z);
+    last_status = millis();
+  }
+#endif
+
+  if (MY_ROLE == ROLE_SENSOR) {
+    static unsigned long last_ping = 0;
+    if (millis() - last_ping > 5000) {
+      myData.msg_id = generateMsgId();
+      myData.original_id = my_id;
+      myData.forwarder_id = my_id;
+      myData.datatype = 1;
+      myData.timestamp = getSyncedTime();
+      myData.hop_count = 0;
+      sendPacket();
+      last_ping = millis();
+    }
+
+    static bool i2c_ok = true;
+    Wire.beginTransmission(ADXL_ADDR);
+    Wire.write(0x32);
+    Wire.endTransmission(false);
+    Wire.requestFrom(ADXL_ADDR, 6);
+    if (Wire.available() >= 6) {
+      if (!i2c_ok) { i2c_ok = true; LOG("i2c_recovered", ""); }
+      float x = (int16_t)(Wire.read() | (Wire.read() << 8)) / 256.0;
+      float y = (int16_t)(Wire.read() | (Wire.read() << 8)) / 256.0;
+      float z = (int16_t)(Wire.read() | (Wire.read() << 8)) / 256.0;
+
+      float dx = x - base_x; float dy = y - base_y; float dz = z - base_z;
+      float delta_magnitude = sqrt(dx*dx + dy*dy + dz*dz);
+
+      if (delta_magnitude >= VIBRATION_THRESHOLD) {
+        float angle_rad = atan2(dy, dx);
+        float angle_deg = angle_rad * 180.0 / PI;
+        if (angle_deg < 0) angle_deg += 360.0;
+
+        myData.msg_id = generateMsgId();
+        myData.original_id = my_id;
+        myData.forwarder_id = my_id;
+        myData.datatype = 3;
+        myData.timestamp = getSyncedTime();
+        myData.hop_count = 0;
+        myData.data_1 = delta_magnitude;
+        myData.data_2 = angle_deg;
+
+        sendPacket();
+        LOG("alarm", ",\"mag\":%.2f,\"bearing\":%.1f", delta_magnitude, angle_deg);
+        delay(200);
+      } else {
+        base_x = base_x * 0.995 + x * 0.005;
+        base_y = base_y * 0.995 + y * 0.005;
+        base_z = base_z * 0.995 + z * 0.005;
+      }
+    } else if (i2c_ok) {
+      i2c_ok = false;
+      LOG("i2c_lost", "");
+    }
+  }
+
+  delay(10);
+}
