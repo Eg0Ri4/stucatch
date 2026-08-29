@@ -140,7 +140,6 @@ often you call `getReport`, and that it stays bounded under a flood.
 
 ## What I need from you
 
-- The repo link, and whether I push straight to it or send you the file.
 - Confirm the object shape your pipeline hands to `ingest` — I assumed the raw
   relay JSON. If you reshape it, I'll adjust `normalize()`.
 - The real node ids so I can fill in `knownNodes`.
