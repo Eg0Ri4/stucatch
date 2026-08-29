@@ -2,12 +2,15 @@
 #include <Wire.h>
 #include <WiFi.h>
 #include <esp_now.h>
+#include <esp_wifi.h>
 #include <math.h>
 
 // ================= НАЛАШТУВАННЯ РОЛІ ПЛАТИ =================
 #define ROLE_HUB    0   // Тільки збирає JSON (кінцева точка)
 #define ROLE_SENSOR 1   // Датчик з ADXL345
 #define ROLE_RELAY  2   // Ретранслятор + ТИМЧАСОВИЙ ХАБ (виводить дані в Serial)
+
+#define WIFI_CHANNEL 6
 
 #define MY_ROLE ROLE_SENSOR   // <--- Встанови цю роль для плати, що підключена до ноута
 // ===========================================================
@@ -130,6 +133,8 @@ void setup() {
 
   uint8_t mac[6];
   WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
   WiFi.macAddress(mac);
   my_id = (mac[2] << 24) | (mac[3] << 16) | (mac[4] << 8) | mac[5];
   
@@ -137,11 +142,11 @@ void setup() {
       Serial.printf("\n=== ЗАПУСК ПЛАТИ | ID: %X | РОЛЬ: СЕНСОР ===\n", my_id);
   }
 
-  if (esp_now_init() != ESP_OK) return;
+  if (esp_now_init() != ESP_OK) { Serial.println("esp_now_init FAILED"); return; }
   esp_now_register_recv_cb(OnDataRecv);
   
   memcpy(peerInfo.peer_addr, broadcastAddress, 6);
-  peerInfo.channel = 0;  
+  peerInfo.channel = WIFI_CHANNEL;  
   peerInfo.encrypt = false;
   esp_now_add_peer(&peerInfo);
 
