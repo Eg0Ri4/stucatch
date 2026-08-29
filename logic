@@ -3,44 +3,59 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
+#include <esp_idf_version.h>
 #include <math.h>
 
-// ================= НАЛАШТУВАННЯ РОЛІ ПЛАТИ =================
-#define ROLE_HUB    0   // Тільки збирає JSON (кінцева точка)
-#define ROLE_SENSOR 1   // Датчик з ADXL345
-#define ROLE_RELAY  2   // Ретранслятор + ТИМЧАСОВИЙ ХАБ (виводить дані в Serial)
+// ================= BOARD ROLE =================
+#define ROLE_HUB    0   // endpoint: prints the data stream as JSON over Serial
+#define ROLE_SENSOR 1   // ADXL345 sensor node
+#define ROLE_RELAY  2   // repeater + temporary hub (also prints JSON)
+
+#define MY_ROLE ROLE_SENSOR   // <--- set per board before flashing
 
 #define WIFI_CHANNEL 6
+#define DEV 1
+#define FW_VERSION "3.0.0-dev"
+// ==============================================
 
-#define MY_ROLE ROLE_SENSOR   // <--- Встанови цю роль для плати, що підключена до ноута
-// ===========================================================
-
-// --- Налаштування датчика (тільки для ROLE_SENSOR) ---
+// --- sensor config (ROLE_SENSOR only) ---
 #define I2C_SDA 8
 #define I2C_SCL 9
 #define ADXL_ADDR 0x53
-const float GRAVITY = 1.0;
-const float VIBRATION_THRESHOLD = 0.20; 
+const float VIBRATION_THRESHOLD = 0.20;
 float base_x = 0.0, base_y = 0.0, base_z = 1.0;
-float manual_direction = 90.0; // Вручну заданий напрямок
+float manual_direction = 90.0;
 
-// --- Глобальні змінні мережі ---
-uint32_t my_id = 0;           
-uint32_t sync_offset = 0;     
-uint32_t last_msg_id = 0;     
+// --- network state ---
+uint32_t my_id = 0;
+uint32_t sync_offset = 0;
+uint32_t last_msg_id = 0;
+uint32_t last_sync_at = 0;
+uint32_t tx_count = 0, rx_count = 0, drop_count = 0;
 
 uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 esp_now_peer_info_t peerInfo;
 
+// ================= LOGGING =================
+// Every serial line is JSON. Log lines carry "ev"; data lines keep the v1 schema.
+// LOG = state transitions and events, always on. TRACE = per-packet noise, DEV only.
+#define LOG(ev, fmt, ...) Serial.printf("{\"type\":\"log\",\"ev\":\"" ev "\",\"id\":\"%X\",\"t\":%lu" fmt "}\n", my_id, (unsigned long)millis(), ##__VA_ARGS__)
+
+#if DEV
+  #define TRACE LOG
+#else
+  #define TRACE(ev, fmt, ...)
+#endif
+
 typedef struct __attribute__((packed)) {
-  uint32_t msg_id;       
-  uint32_t original_id;  
-  uint32_t forwarder_id; 
-  uint8_t  datatype;     
-  uint32_t timestamp;    
-  uint8_t  hop_count;    
-  float    data_1;       
-  float    data_2;       
+  uint32_t msg_id;
+  uint32_t original_id;
+  uint32_t forwarder_id;
+  uint8_t  datatype;
+  uint32_t timestamp;
+  uint8_t  hop_count;
+  float    data_1;
+  float    data_2;
 } MeshPacket;
 
 MeshPacket myData;
@@ -53,65 +68,96 @@ uint32_t getSyncedTime() {
   return millis() - sync_offset;
 }
 
-// ================= ЛОГІКА ESP-NOW =================
+// ================= ESP-NOW =================
 void sendPacket() {
-  esp_now_send(broadcastAddress, (uint8_t *) &myData, sizeof(myData));
+  esp_err_t err = esp_now_send(broadcastAddress, (uint8_t *) &myData, sizeof(myData));
+  tx_count++;
+  if (err != ESP_OK) LOG("send_error", ",\"code\":%d,\"msgType\":%d", err, myData.datatype);
+  else TRACE("tx", ",\"msgType\":%d,\"msgId\":%u,\"time\":%u", myData.datatype, myData.msg_id, myData.timestamp);
+}
+
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 0)
+void OnDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
+#else
+void OnDataSent(const uint8_t *mac, esp_now_send_status_t status) {
+#endif
+  TRACE("tx_result", ",\"ok\":%d", status == ESP_NOW_SEND_SUCCESS);
 }
 
 void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
-  if (len != sizeof(MeshPacket)) return;
-  
+  if (len != sizeof(MeshPacket)) {
+    drop_count++;
+    LOG("drop", ",\"why\":\"size\",\"len\":%d", len);
+    return;
+  }
+
   MeshPacket recvData;
   memcpy(&recvData, incomingData, sizeof(recvData));
 
-  if (recvData.original_id == my_id) return;
-  if (recvData.msg_id == last_msg_id) return;
-  
-  last_msg_id = recvData.msg_id;
-  int rssi = info->rx_ctrl->rssi; 
+  if (recvData.original_id == my_id) {
+    TRACE("drop", ",\"why\":\"own\",\"msgId\":%u", recvData.msg_id);
+    return;
+  }
+  if (recvData.msg_id == last_msg_id) {
+    drop_count++;
+    TRACE("drop", ",\"why\":\"dupe\",\"msgId\":%u", recvData.msg_id);
+    return;
+  }
 
-  // --- ВИВІД JSON: Тепер працює і для ХАБА, і для РЕЛЕ ---
+  last_msg_id = recvData.msg_id;
+  rx_count++;
+  int rssi = info->rx_ctrl->rssi;
+
+  TRACE("rx", ",\"msgType\":%d,\"orig\":\"%X\",\"fwd\":\"%X\",\"hops\":%d,\"rssi\":%d,\"time\":%u",
+        recvData.datatype, recvData.original_id, recvData.forwarder_id, recvData.hop_count, rssi, recvData.timestamp);
+
+  // --- DATA LINE (hub + relay) — v1 schema, the Pi parses this, do not change ---
   if (MY_ROLE == ROLE_HUB || MY_ROLE == ROLE_RELAY) {
     Serial.printf("{\"msg_id\":%u, \"orig_id\":\"%X\", \"fwd_id\":\"%X\", \"type\":%d, \"time\":%u, \"hops\":%d, \"d1\":%.2f, \"d2\":%.2f, \"rssi\":%d}\n",
-                  recvData.msg_id, recvData.original_id, recvData.forwarder_id, recvData.datatype, 
+                  recvData.msg_id, recvData.original_id, recvData.forwarder_id, recvData.datatype,
                   recvData.timestamp, recvData.hop_count, recvData.data_1, recvData.data_2, rssi);
   }
 
-  // --- СИНХРОНІЗАЦІЯ ЧАСУ ---
+  // --- time sync ---
   if (recvData.datatype == 0 && MY_ROLE == ROLE_SENSOR) {
+    uint32_t previous = sync_offset;
     sync_offset = millis() - recvData.timestamp;
-    Serial.println("[SYNC] Час синхронізовано!");
+    last_sync_at = millis();
+    LOG("sync", ",\"from\":\"%X\",\"offset\":%u,\"delta\":%ld", recvData.original_id, sync_offset, (long)(sync_offset - previous));
   }
 
-  // --- ЛОГІКА РЕЛЕ (Пересилання) ---
+  // --- relay forwarding ---
   if (MY_ROLE == ROLE_RELAY && recvData.datatype != 0 && recvData.hop_count == 0) {
     MeshPacket relayData = recvData;
     relayData.forwarder_id = my_id;
-    relayData.hop_count += 1; 
-    
+    relayData.hop_count += 1;
+
     delay(5);
     esp_now_send(broadcastAddress, (uint8_t *) &relayData, sizeof(relayData));
-    // Вивід статусу ретрансляції прибрано з Serial, щоб не ламати структуру JSON для парсера
+    tx_count++;
+    TRACE("relay", ",\"msgType\":%d,\"orig\":\"%X\",\"msgId\":%u", relayData.datatype, relayData.original_id, relayData.msg_id);
   }
 
-  // --- ЛОГІКА ДАТЧИКА (Карта дистанцій) ---
+  // --- sensor: range reply to a heard ping ---
   if (MY_ROLE == ROLE_SENSOR && recvData.datatype == 1) {
     myData.msg_id = generateMsgId();
     myData.original_id = my_id;
     myData.forwarder_id = my_id;
-    myData.datatype = 2; 
+    myData.datatype = 2;
     myData.timestamp = getSyncedTime();
     myData.hop_count = 0;
-    myData.data_1 = rssi;                     
-    myData.data_2 = manual_direction;         
+    myData.data_1 = rssi;
+    myData.data_2 = manual_direction;
     sendPacket();
+    LOG("range", ",\"heard\":\"%X\",\"rssi\":%d", recvData.original_id, rssi);
   }
 }
 
-// ================= ІНІЦІАЛІЗАЦІЯ СЕНСОРА =================
+// ================= SENSOR INIT =================
 void calibrateBaseline() {
+  LOG("calibrating", "");
   float sum_x = 0, sum_y = 0, sum_z = 0;
-  int samples = 100;
+  int samples = 100, good = 0;
   for (int i = 0; i < samples; i++) {
     Wire.beginTransmission(ADXL_ADDR);
     Wire.write(0x32);
@@ -121,10 +167,12 @@ void calibrateBaseline() {
       sum_x += (int16_t)(Wire.read() | (Wire.read() << 8)) / 256.0;
       sum_y += (int16_t)(Wire.read() | (Wire.read() << 8)) / 256.0;
       sum_z += (int16_t)(Wire.read() | (Wire.read() << 8)) / 256.0;
+      good++;
     }
     delay(20);
   }
   base_x = sum_x / samples; base_y = sum_y / samples; base_z = sum_z / samples;
+  LOG("calibrated", ",\"good\":%d,\"of\":%d,\"x\":%.3f,\"y\":%.3f,\"z\":%.3f", good, samples, base_x, base_y, base_z);
 }
 
 void setup() {
@@ -132,23 +180,32 @@ void setup() {
   delay(1000);
 
   uint8_t mac[6];
+  WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
-  WiFi.disconnect();
+  WiFi.disconnect(false, true);
   esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);
   WiFi.macAddress(mac);
   my_id = (mac[2] << 24) | (mac[3] << 16) | (mac[4] << 8) | mac[5];
-  
-  if (MY_ROLE != ROLE_HUB && MY_ROLE != ROLE_RELAY) {
-      Serial.printf("\n=== ЗАПУСК ПЛАТИ | ID: %X | РОЛЬ: СЕНСОР ===\n", my_id);
-  }
 
-  if (esp_now_init() != ESP_OK) { Serial.println("esp_now_init FAILED"); return; }
+  LOG("boot", ",\"fw\":\"" FW_VERSION "\",\"role\":%d,\"channel\":%d,\"txPower\":%d,\"dev\":%d", MY_ROLE, WIFI_CHANNEL, (int)WiFi.getTxPower(), DEV);
+
+  if (esp_now_init() != ESP_OK) {
+    LOG("espnow_init_failed", "");
+    return;
+  }
   esp_now_register_recv_cb(OnDataRecv);
-  
+  esp_now_register_send_cb(OnDataSent);
+
   memcpy(peerInfo.peer_addr, broadcastAddress, 6);
-  peerInfo.channel = WIFI_CHANNEL;  
+  peerInfo.channel = WIFI_CHANNEL;
   peerInfo.encrypt = false;
-  esp_now_add_peer(&peerInfo);
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    LOG("peer_add_failed", "");
+    return;
+  }
+  LOG("espnow_ready", "");
 
   if (MY_ROLE == ROLE_SENSOR) {
     Wire.begin(I2C_SDA, I2C_SCL);
@@ -157,13 +214,14 @@ void setup() {
     Wire.beginTransmission(ADXL_ADDR); Wire.write(0x31); Wire.write(0x0B); Wire.endTransmission();
     calibrateBaseline();
   }
+  LOG("ready", "");
 }
 
 void loop() {
-  // --- ТЕПЕР РЕЛЕ ТАКОЖ РОЗДАЄ СИНХРОНІЗАЦІЮ ЧАСУ ---
+  // --- hub + relay broadcast time sync ---
   if (MY_ROLE == ROLE_HUB || MY_ROLE == ROLE_RELAY) {
     static unsigned long last_sync = 0;
-    if (millis() - last_sync > 10000) { 
+    if (millis() - last_sync > 10000) {
       myData.msg_id = generateMsgId();
       myData.original_id = my_id;
       myData.forwarder_id = my_id;
@@ -175,6 +233,16 @@ void loop() {
       last_sync = millis();
     }
   }
+
+#if DEV
+  static unsigned long last_status = 0;
+  if (millis() - last_status > 10000) {
+    LOG("status", ",\"up\":%lu,\"syncAge\":%ld,\"tx\":%u,\"rx\":%u,\"drop\":%u,\"heap\":%u",
+        millis() / 1000, last_sync_at ? (long)(millis() - last_sync_at) : -1L, tx_count, rx_count, drop_count, (unsigned)ESP.getFreeHeap());
+    if (MY_ROLE == ROLE_SENSOR) LOG("baseline", ",\"x\":%.3f,\"y\":%.3f,\"z\":%.3f", base_x, base_y, base_z);
+    last_status = millis();
+  }
+#endif
 
   if (MY_ROLE == ROLE_SENSOR) {
     static unsigned long last_ping = 0;
@@ -189,11 +257,13 @@ void loop() {
       last_ping = millis();
     }
 
+    static bool i2c_ok = true;
     Wire.beginTransmission(ADXL_ADDR);
     Wire.write(0x32);
     Wire.endTransmission(false);
     Wire.requestFrom(ADXL_ADDR, 6);
     if (Wire.available() >= 6) {
+      if (!i2c_ok) { i2c_ok = true; LOG("i2c_recovered", ""); }
       float x = (int16_t)(Wire.read() | (Wire.read() << 8)) / 256.0;
       float y = (int16_t)(Wire.read() | (Wire.read() << 8)) / 256.0;
       float z = (int16_t)(Wire.read() | (Wire.read() << 8)) / 256.0;
@@ -212,17 +282,20 @@ void loop() {
         myData.datatype = 3;
         myData.timestamp = getSyncedTime();
         myData.hop_count = 0;
-        myData.data_1 = delta_magnitude;  
-        myData.data_2 = angle_deg;        
+        myData.data_1 = delta_magnitude;
+        myData.data_2 = angle_deg;
 
         sendPacket();
-        Serial.printf("[ТРИВОГА] Удар %.2fg відправлено в Mesh!\n", delta_magnitude);
-        delay(200); 
+        LOG("alarm", ",\"mag\":%.2f,\"bearing\":%.1f", delta_magnitude, angle_deg);
+        delay(200);
       } else {
         base_x = base_x * 0.995 + x * 0.005;
         base_y = base_y * 0.995 + y * 0.005;
         base_z = base_z * 0.995 + z * 0.005;
       }
+    } else if (i2c_ok) {
+      i2c_ok = false;
+      LOG("i2c_lost", "");
     }
   }
 
