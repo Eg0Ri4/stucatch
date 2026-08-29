@@ -36,7 +36,15 @@ server.listen(config.http.port, config.http.host, () => {
 
 let stopSource = () => {};
 
-if (config.simulate) {
+if (process.argv.includes('--stdin')) {
+  log('mode', 'STDIN — reading NDJSON from standard input (e.g. mesh-sim), no serial port opened');
+  store.setSerialStatus({ state: 'stdin', path: '(stdin)', attempts: 0 });
+  const { createInterface } = await import('node:readline');
+  const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
+  rl.on('line', (line) => store.ingestLine(line));
+  rl.on('close', () => log('stdin', 'input ended — dashboard stays up with last state'));
+  stopSource = () => rl.close();
+} else if (config.simulate) {
   log('mode', 'SIMULATE — synthetic v4 traffic, no serial port opened');
   store.setSerialStatus({ state: 'simulated', path: '(simulator)', attempts: 0 });
   stopSource = startSimulator((line) => store.ingestLine(line));

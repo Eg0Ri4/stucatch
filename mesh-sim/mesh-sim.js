@@ -103,6 +103,7 @@ const witness = (node, origin, seq) => {
   return 1;
 };
 
+process.stdout.on("error", (err) => { if (err.code === "EPIPE") process.exit(0); throw err; });
 const out = (obj) => process.stdout.write(JSON.stringify(obj) + "\n");
 const log = (ev, fields = {}) => out({ type: "log", ev, id: gateway.id, t: raw(gateway), ...fields });
 const trace = (ev, fields) => { if (DEV) log(ev, fields); };
