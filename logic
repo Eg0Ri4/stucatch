@@ -9,9 +9,22 @@
 #include <math.h>
 
 // ================= BOARD ROLE =================
-#define ROLE_HUB    0   // endpoint: time authority, prints every reception as JSON over Serial
-#define ROLE_SENSOR 1   // ADXL345 sensor node
-#define ROLE_RELAY  2   // repeater (also prints JSON, usable as temporary hub)
+// One firmware, three roles. MY_ROLE is compile-time: every board must be flashed
+// with its own role, and a wrong role fails SILENTLY on the radio side — the mesh
+// still flows, but the board behaves as something else. Know the tells:
+//
+// Every role prints every reception as a {"v":4,...} data line — any board on a
+// serial port is a full gateway. Roles differ only in what they DO on the radio:
+//
+//   ROLE_HUB     time authority. The ONLY board that mints SYNC (kind 0, every
+//                10s). Exactly ONE hub on air — two hubs = two clock authorities.
+//   ROLE_SENSOR  reads the ADXL, pings, alarms, answers direct pings with RANGE.
+//   ROLE_RELAY   re-broadcasts what it hears (hop+1, max MAX_HOPS); mints nothing.
+//
+// After flashing, the boot log confirms: {"ev":"boot",...,"role":0|1|2}.
+#define ROLE_HUB    0
+#define ROLE_SENSOR 1
+#define ROLE_RELAY  2
 
 #define MY_ROLE ROLE_SENSOR   // <--- set per board before flashing
 
@@ -272,8 +285,10 @@ void processReception(const RxSlot *slot) {
   TRACE("rx", ",\"kind\":%d,\"origin\":\"%X\",\"seq\":%u,\"hops\":%d,\"rssi\":%d,\"verdict\":%d",
         header.kind, header.origin, header.seq, header.hops, slot->rssi, verdict);
 
-  // hub + relay print EVERY reception, duplicates included — the Pi owns dedup
-  if (MY_ROLE == ROLE_HUB || MY_ROLE == ROLE_RELAY) printReception(&header, payload, slot->rssi);
+  // Every board prints every reception, duplicates included — whoever is on the
+  // serial port gets the full stream. The Pi owns dedup, and a duplicate carries
+  // its own path facts (via/hops/rssi).
+  printReception(&header, payload, slot->rssi);
 
   // clock: any non-hub applies a SYNC — offset, epoch, both logged as a transition
   if (header.kind == KIND_SYNC && MY_ROLE != ROLE_HUB) {
@@ -312,10 +327,14 @@ void drainRx() {
     processReception((const RxSlot *)&rxRing[rxTail]);
     rxTail = (rxTail + 1) % RX_SLOTS;
   }
-  static uint16_t reported_overflow = 0;
+  static uint32_t reported_overflow = 0, reported_drop = 0;
   if (overflow_count != reported_overflow) {
     reported_overflow = overflow_count;
     LOG("rx_overflow", ",\"total\":%u", overflow_count);
+  }
+  if (drop_count != reported_drop) {
+    reported_drop = drop_count;
+    LOG("rx_drop", ",\"total\":%u", drop_count);
   }
 }
 
