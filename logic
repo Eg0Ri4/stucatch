@@ -16,10 +16,10 @@
 // Every role prints every reception as a {"v":4,...} data line — any board on a
 // serial port is a full gateway. Roles differ only in what they DO on the radio:
 //
-//   ROLE_HUB     time authority. The ONLY board that mints SYNC (kind 0, every
-//                10s). Exactly ONE hub on air — two hubs = two clock authorities.
-//   ROLE_SENSOR  reads the ADXL, pings, alarms, answers direct pings with RANGE.
-//   ROLE_RELAY   re-broadcasts what it hears (hop+1, max MAX_HOPS); mints nothing.
+//   ROLE_HUB    time authority. The ONLY board that mints SYNC (kind 0, every
+//               10s). Exactly ONE hub on air — two hubs = two clock authorities.
+//   ROLE_SENSOR reads the ADXL, pings, alarms, answers direct pings with RANGE.
+//   ROLE_RELAY  re-broadcasts what it hears (hop+1, max MAX_HOPS); mints nothing.
 //
 // After flashing, the boot log confirms: {"ev":"boot",...,"role":0|1|2}.
 #define ROLE_HUB    0
@@ -477,8 +477,22 @@ void loop() {
       float dx = x - base_x, dy = y - base_y, dz = z - base_z;
       float delta_magnitude = sqrt(dx * dx + dy * dy + dz * dz);
 
-      if (delta_magnitude >= VIBRATION_THRESHOLD) {
-        float angle_deg = atan2(dy, dx) * 180.0 / PI;
+      // Determine the overall gravity force to see if this is just a tilt
+      float total_g = sqrt(x * x + y * y + z * z);
+      bool is_just_tilt = (fabs(total_g - 1.0) < 0.2) && (delta_magnitude >= VIBRATION_THRESHOLD);
+
+      if (is_just_tilt) {
+        // If it's just a change in spatial orientation (e.g., turning upside down),
+        // rapidly reset the baseline to the new position and do NOT send any alarms to the hub
+        base_x = x;
+        base_y = y;
+        base_z = z;
+      } 
+      else if (delta_magnitude >= VIBRATION_THRESHOLD) {
+        // This is a real vibration or sharp shock
+        // Correct the azimuth for upside-down orientation
+        float effective_dy = (base_z < 0) ? -dy : dy;
+        float angle_deg = atan2(effective_dy, dx) * 180.0 / PI;
         if (angle_deg < 0) angle_deg += 360.0;
 
         AlarmPayload alarm = { delta_magnitude, angle_deg };
@@ -489,6 +503,7 @@ void loop() {
         LOG("alarm", ",\"mag\":%.2f,\"bearing\":%.1f,\"seq\":%u", delta_magnitude, angle_deg, my_seq);
         delay(200);
       } else {
+        // Standard resting state — slowly update the baseline
         base_x = base_x * 0.995 + x * 0.005;
         base_y = base_y * 0.995 + y * 0.005;
         base_z = base_z * 0.995 + z * 0.005;
