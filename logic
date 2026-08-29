@@ -27,12 +27,12 @@
 #define ROLE_RELAY  2
 
 #define MY_ROLE ROLE_SENSOR   // <--- set per board before flashing
+#define DEV 1                 // 1 = per-packet tx/rx/relay traces + 10s status logs; 0 compiles them out. Data + state-transition lines print either way
 
 #define PROTOCOL_VERSION 4
 #define FW_VERSION "4.0.0-dev"
 #define FW_MAJOR 4
 #define WIFI_CHANNEL 6
-#define DEV 1
 #define MAX_HOPS 2
 // ==============================================
 
