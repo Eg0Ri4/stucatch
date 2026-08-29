@@ -1,0 +1,30 @@
+# systemd unit — keeps the gateway app running for the whole event.
+#
+#   sudo cp deploy/stucatch-pi.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now stucatch-pi
+#   journalctl -u stucatch-pi -f          # live logs
+#
+# Edit User=, WorkingDirectory= and ExecStart= node path for your Pi.
+
+[Unit]
+Description=STUCATCH Pi gateway (ESP32 mesh -> dashboard)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/pi-app
+ExecStart=/usr/bin/node src/index.js
+Restart=always
+RestartSec=3
+# force a serial port instead of auto-detect, and/or a different HTTP port:
+# Environment=SERIAL_PATH=/dev/ttyACM0
+# Environment=HTTP_PORT=3000
+# Environment=HTTP_HOST=0.0.0.0
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

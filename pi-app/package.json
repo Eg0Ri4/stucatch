@@ -1,0 +1,23 @@
+{
+  "name": "stucatch-pi",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Raspberry Pi gateway app: reads the ESP32 mesh gateway over USB serial, parses the v4 protocol, keeps live node state, serves a dashboard + JSON API.",
+  "engines": {
+    "node": ">=18"
+  },
+  "bin": {
+    "stucatch-pi": "src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "sim": "node src/index.js --simulate",
+    "dev": "node --watch src/index.js --simulate",
+    "test": "node --test test/protocol.test.js test/store.test.js",
+    "replay": "node tools/replay.js"
+  },
+  "dependencies": {
+    "serialport": "^12.0.0"
+  }
+}
