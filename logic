@@ -1,0 +1,225 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <math.h>
+
+// ================= НАЛАШТУВАННЯ РОЛІ ПЛАТИ =================
+#define ROLE_HUB    0   // Тільки збирає JSON (кінцева точка)
+#define ROLE_SENSOR 1   // Датчик з ADXL345
+#define ROLE_RELAY  2   // Ретранслятор + ТИМЧАСОВИЙ ХАБ (виводить дані в Serial)
+
+#define MY_ROLE ROLE_SENSOR   // <--- Встанови цю роль для плати, що підключена до ноута
+// ===========================================================
+
+// --- Налаштування датчика (тільки для ROLE_SENSOR) ---
+#define I2C_SDA 8
+#define I2C_SCL 9
+#define ADXL_ADDR 0x53
+const float GRAVITY = 1.0;
+const float VIBRATION_THRESHOLD = 0.20; 
+float base_x = 0.0, base_y = 0.0, base_z = 1.0;
+float manual_direction = 90.0; // Вручну заданий напрямок
+
+// --- Глобальні змінні мережі ---
+uint32_t my_id = 0;           
+uint32_t sync_offset = 0;     
+uint32_t last_msg_id = 0;     
+
+uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+esp_now_peer_info_t peerInfo;
+
+typedef struct __attribute__((packed)) {
+  uint32_t msg_id;       
+  uint32_t original_id;  
+  uint32_t forwarder_id; 
+  uint8_t  datatype;     
+  uint32_t timestamp;    
+  uint8_t  hop_count;    
+  float    data_1;       
+  float    data_2;       
+} MeshPacket;
+
+MeshPacket myData;
+
+uint32_t generateMsgId() {
+  return (millis() & 0xFFFFFF) | (my_id << 24);
+}
+
+uint32_t getSyncedTime() {
+  return millis() - sync_offset;
+}
+
+// ================= ЛОГІКА ESP-NOW =================
+void sendPacket() {
+  esp_now_send(broadcastAddress, (uint8_t *) &myData, sizeof(myData));
+}
+
+void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
+  if (len != sizeof(MeshPacket)) return;
+  
+  MeshPacket recvData;
+  memcpy(&recvData, incomingData, sizeof(recvData));
+
+  if (recvData.original_id == my_id) return;
+  if (recvData.msg_id == last_msg_id) return;
+  
+  last_msg_id = recvData.msg_id;
+  int rssi = info->rx_ctrl->rssi; 
+
+  // --- ВИВІД JSON: Тепер працює і для ХАБА, і для РЕЛЕ ---
+  if (MY_ROLE == ROLE_HUB || MY_ROLE == ROLE_RELAY) {
+    Serial.printf("{\"msg_id\":%u, \"orig_id\":\"%X\", \"fwd_id\":\"%X\", \"type\":%d, \"time\":%u, \"hops\":%d, \"d1\":%.2f, \"d2\":%.2f, \"rssi\":%d}\n",
+                  recvData.msg_id, recvData.original_id, recvData.forwarder_id, recvData.datatype, 
+                  recvData.timestamp, recvData.hop_count, recvData.data_1, recvData.data_2, rssi);
+  }
+
+  // --- СИНХРОНІЗАЦІЯ ЧАСУ ---
+  if (recvData.datatype == 0 && MY_ROLE == ROLE_SENSOR) {
+    sync_offset = millis() - recvData.timestamp;
+    Serial.println("[SYNC] Час синхронізовано!");
+  }
+
+  // --- ЛОГІКА РЕЛЕ (Пересилання) ---
+  if (MY_ROLE == ROLE_RELAY && recvData.datatype != 0 && recvData.hop_count == 0) {
+    MeshPacket relayData = recvData;
+    relayData.forwarder_id = my_id;
+    relayData.hop_count += 1; 
+    
+    delay(5);
+    esp_now_send(broadcastAddress, (uint8_t *) &relayData, sizeof(relayData));
+    // Вивід статусу ретрансляції прибрано з Serial, щоб не ламати структуру JSON для парсера
+  }
+
+  // --- ЛОГІКА ДАТЧИКА (Карта дистанцій) ---
+  if (MY_ROLE == ROLE_SENSOR && recvData.datatype == 1) {
+    myData.msg_id = generateMsgId();
+    myData.original_id = my_id;
+    myData.forwarder_id = my_id;
+    myData.datatype = 2; 
+    myData.timestamp = getSyncedTime();
+    myData.hop_count = 0;
+    myData.data_1 = rssi;                     
+    myData.data_2 = manual_direction;         
+    sendPacket();
+  }
+}
+
+// ================= ІНІЦІАЛІЗАЦІЯ СЕНСОРА =================
+void calibrateBaseline() {
+  float sum_x = 0, sum_y = 0, sum_z = 0;
+  int samples = 100;
+  for (int i = 0; i < samples; i++) {
+    Wire.beginTransmission(ADXL_ADDR);
+    Wire.write(0x32);
+    Wire.endTransmission(false);
+    Wire.requestFrom(ADXL_ADDR, 6);
+    if (Wire.available() >= 6) {
+      sum_x += (int16_t)(Wire.read() | (Wire.read() << 8)) / 256.0;
+      sum_y += (int16_t)(Wire.read() | (Wire.read() << 8)) / 256.0;
+      sum_z += (int16_t)(Wire.read() | (Wire.read() << 8)) / 256.0;
+    }
+    delay(20);
+  }
+  base_x = sum_x / samples; base_y = sum_y / samples; base_z = sum_z / samples;
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  uint8_t mac[6];
+  WiFi.mode(WIFI_STA);
+  WiFi.macAddress(mac);
+  my_id = (mac[2] << 24) | (mac[3] << 16) | (mac[4] << 8) | mac[5];
+  
+  if (MY_ROLE != ROLE_HUB && MY_ROLE != ROLE_RELAY) {
+      Serial.printf("\n=== ЗАПУСК ПЛАТИ | ID: %X | РОЛЬ: СЕНСОР ===\n", my_id);
+  }
+
+  if (esp_now_init() != ESP_OK) return;
+  esp_now_register_recv_cb(OnDataRecv);
+  
+  memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+  peerInfo.channel = 0;  
+  peerInfo.encrypt = false;
+  esp_now_add_peer(&peerInfo);
+
+  if (MY_ROLE == ROLE_SENSOR) {
+    Wire.begin(I2C_SDA, I2C_SCL);
+    delay(100);
+    Wire.beginTransmission(ADXL_ADDR); Wire.write(0x2D); Wire.write(0x08); Wire.endTransmission();
+    Wire.beginTransmission(ADXL_ADDR); Wire.write(0x31); Wire.write(0x0B); Wire.endTransmission();
+    calibrateBaseline();
+  }
+}
+
+void loop() {
+  // --- ТЕПЕР РЕЛЕ ТАКОЖ РОЗДАЄ СИНХРОНІЗАЦІЮ ЧАСУ ---
+  if (MY_ROLE == ROLE_HUB || MY_ROLE == ROLE_RELAY) {
+    static unsigned long last_sync = 0;
+    if (millis() - last_sync > 10000) { 
+      myData.msg_id = generateMsgId();
+      myData.original_id = my_id;
+      myData.forwarder_id = my_id;
+      myData.datatype = 0;
+      myData.timestamp = millis();
+      myData.hop_count = 0;
+      myData.data_1 = 0; myData.data_2 = 0;
+      sendPacket();
+      last_sync = millis();
+    }
+  }
+
+  if (MY_ROLE == ROLE_SENSOR) {
+    static unsigned long last_ping = 0;
+    if (millis() - last_ping > 5000) {
+      myData.msg_id = generateMsgId();
+      myData.original_id = my_id;
+      myData.forwarder_id = my_id;
+      myData.datatype = 1;
+      myData.timestamp = getSyncedTime();
+      myData.hop_count = 0;
+      sendPacket();
+      last_ping = millis();
+    }
+
+    Wire.beginTransmission(ADXL_ADDR);
+    Wire.write(0x32);
+    Wire.endTransmission(false);
+    Wire.requestFrom(ADXL_ADDR, 6);
+    if (Wire.available() >= 6) {
+      float x = (int16_t)(Wire.read() | (Wire.read() << 8)) / 256.0;
+      float y = (int16_t)(Wire.read() | (Wire.read() << 8)) / 256.0;
+      float z = (int16_t)(Wire.read() | (Wire.read() << 8)) / 256.0;
+
+      float dx = x - base_x; float dy = y - base_y; float dz = z - base_z;
+      float delta_magnitude = sqrt(dx*dx + dy*dy + dz*dz);
+
+      if (delta_magnitude >= VIBRATION_THRESHOLD) {
+        float angle_rad = atan2(dy, dx);
+        float angle_deg = angle_rad * 180.0 / PI;
+        if (angle_deg < 0) angle_deg += 360.0;
+
+        myData.msg_id = generateMsgId();
+        myData.original_id = my_id;
+        myData.forwarder_id = my_id;
+        myData.datatype = 3;
+        myData.timestamp = getSyncedTime();
+        myData.hop_count = 0;
+        myData.data_1 = delta_magnitude;  
+        myData.data_2 = angle_deg;        
+
+        sendPacket();
+        Serial.printf("[ТРИВОГА] Удар %.2fg відправлено в Mesh!\n", delta_magnitude);
+        delay(200); 
+      } else {
+        base_x = base_x * 0.995 + x * 0.005;
+        base_y = base_y * 0.995 + y * 0.005;
+        base_z = base_z * 0.995 + z * 0.005;
+      }
+    }
+  }
+
+  delay(10);
+}
